@@ -2,7 +2,7 @@
 
 分布式游戏服务器框架是一个基于 C++ 的分布式游戏服务器集群框架。项目采用进程化微服务架构，将玩家接入、登录认证、消息路由、业务逻辑、场景管理、战斗协调、战斗引擎与数据库访问拆分为独立节点，便于按服务职责扩展和部署。
 
-![架构全景图](docs/architecture/panoramic_architecture_diagram.png)
+![架构全景图](architecture/panoramic_architecture_diagram.png)
 
 ## 架构设计概述
 
@@ -47,7 +47,7 @@ Client -> HAProxy -> Gateway/Login -> Transport(Local/Remote) -> Logic/Scenes/Gl
 - **OAuth 2.0 认证**：Google / Facebook / Apple 三大提供商（授权码模式 + JWT 验证 + JWKS 验签）
 - **Kubernetes 部署**：`k8s/` 目录提供 base + overlays dev/prod 的 Kustomize 配置
 
-更完整的架构细节见 [docs/architecture/architecture_design.md](docs/architecture/architecture_design.md)。
+更完整的架构细节见 [architecture/architecture_design.md](architecture/architecture_design.md)。
 
 ## 技术栈
 
@@ -105,33 +105,33 @@ NIMBUS_IMAGE=ghcr.io/<org>/nimbuscluster:<tag> sh docker-compose-prod-up.sh
 sh docker-compose-prod-down.sh
 ```
 
-部署环境、依赖安装、端口和脚本关系见 [docs/deployment/deployment.md](docs/deployment/deployment.md)。
+部署环境、依赖安装、端口和脚本关系见 [deployment/deployment.md](deployment/deployment.md)。
 
 ## 文档索引
 
 ### 阅读路径建议
 
-- **第一次接触本项目**：先读本文（README），再读 [架构设计](docs/architecture/architecture_design.md)
-- **准备搭本机开发环境**：读 [部署指南](docs/deployment/deployment.md)，以及 [Ubuntu Docker 安装](docs/deployment/ubuntu_docker_setup.md)
-- **准备部署到生产或 Kubernetes**：先读 [部署指南](docs/deployment/deployment.md)，再读 [Kubernetes 部署](docs/deployment/kubernetes.md)
-- **了解 CI/CD 流水线**：读 [GitLab CI/CD](docs/devops/gitlab-ci-cd.md)
+- **第一次接触本项目**：先读本文（README），再读 [架构设计](architecture/architecture_design.md)
+- **准备搭本机开发环境**：读 [部署指南](deployment/deployment.md)，以及 [Ubuntu Docker 安装](deployment/ubuntu_docker_setup.md)
+- **准备部署到生产或 Kubernetes**：先读 [部署指南](deployment/deployment.md)，再读 [Kubernetes 部署](deployment/kubernetes.md)
+- **了解 CI/CD 流水线**：读 [GitLab CI/CD](devops/gitlab-ci-cd.md)
 
 ### 架构设计
 
 | 文档 | 重点 |
 |------|------|
-| [architecture/architecture_design.md](docs/architecture/architecture_design.md) | 服务节点职责、CompositeTransport 通信模型、MessageHandler 7 步流水线、核心业务流程、存储设计、关键设计模式 |
+| [architecture/architecture_design.md](architecture/architecture_design.md) | 服务节点职责、CompositeTransport 通信模型、MessageHandler 7 步流水线、核心业务流程、存储设计、关键设计模式 |
 
 ### 部署运维
 
 | 文档 | 重点 |
 |------|------|
-| [deployment/deployment.md](docs/deployment/deployment.md) | 本地构建、Docker Compose 启停（开发 + 生产）、端口与配置、服务启动顺序 |
-| [deployment/kubernetes.md](docs/deployment/kubernetes.md) | Kubernetes + Kustomize 部署：base 与 overlays dev/prod 结构、部署/销毁脚本 |
-| [deployment/ubuntu_docker_setup.md](docs/deployment/ubuntu_docker_setup.md) | Ubuntu 上 Docker / Docker Compose / 内核配置（shm_size、core_pattern、ipcmk）一次性安装 |
+| [deployment/deployment.md](deployment/deployment.md) | 本地构建、Docker Compose 启停（开发 + 生产）、端口与配置、服务启动顺序 |
+| [deployment/kubernetes.md](deployment/kubernetes.md) | Kubernetes + Kustomize 部署：base 与 overlays dev/prod 结构、部署/销毁脚本 |
+| [deployment/ubuntu_docker_setup.md](deployment/ubuntu_docker_setup.md) | Ubuntu 上 Docker / Docker Compose / 内核配置（shm_size、core_pattern、ipcmk）一次性安装 |
 
 ### 工程流程
 
 | 文档 | 重点 |
 |------|------|
-| [devops/gitlab-ci-cd.md](docs/devops/gitlab-ci-cd.md) | GitLab CI 4-stage 流水线：build → test → image → deploy |
+| [devops/gitlab-ci-cd.md](devops/gitlab-ci-cd.md) | GitLab CI 4-stage 流水线：build → test → image → deploy |
