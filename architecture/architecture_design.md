@@ -654,7 +654,7 @@ public:
     virtual int BroadcastCrossRegion(uint16_t cmd, UserId uid, uint32_t server_type,
                                      const google::protobuf::Message& msg) = 0;
 
-    virtual int Forward(const protocol::MessageInfo& msg) = 0;
+    virtual int Forward(const protocol::Payload& msg) = 0;
 
     // 异步请求：注册 RequestCorrelator，等待 Complete(seq, reply) 触发 cb
     virtual int AsyncRequest(uint16_t cmd, UserId uid, uint32_t server_type,
@@ -677,7 +677,7 @@ CompositeTransport 是**唯一持有路由表本地缓存的组件**，路由表
 CompositeTransport 的 `Forward` 是核心路由决策点：
 
 ```cpp
-int CompositeTransport::Forward(const protocol::MessageInfo& msg)
+int CompositeTransport::Forward(const protocol::Payload& msg)
 {
     uint32_t const dst = msg.head().dst();
     if (IsSameRegion(server_id(), dst))
@@ -748,7 +748,7 @@ bool RequestIdExitst(uint64_t seq) const;
 ### 4.7 消息编码
 
 统一使用 Protobuf：
-- `protocol/message.proto` 定义外层消息 `MessageInfo`（head + body）
+- `protocol/message.proto` 定义外层消息 `Payload`（head + body）
 - `protocol/commonenum.proto` 定义 cmd 枚举
 - 各业务目录下 `*.proto` 定义业务消息（如 `battle/battlerpc.proto`）
 
