@@ -44,20 +44,20 @@ cmake --build .
 
 ## 2. CI 本地验证
 
-仓库提供 `scripts/ci-local.sh` 用于在 Linux 环境模拟 CI 流程：
+仓库提供 `scripts/local_ci.sh` 用于在 Linux 环境模拟 CI 流程：
 
 ```bash
-bash scripts/ci-local.sh
+bash scripts/local_ci.sh
 ```
 
 该脚本会执行：
 
-1. 检查 Git 仓库状态
-2. 初始化 Git 子模块
-3. 安装构建依赖
-4. 以 Release 模式配置 CMake
-5. 编译项目（`cmake --build build -- -j$(nproc)`）
-6. 运行 `ctest --output-on-failure -j$(nproc)`
+1. 在 build-server 容器内编译项目（`cmake --build build -- -j4`）
+2. 将产物安装到 `release/` 目录（`cmake --install build`）
+3. 校验 7 个必需的二进制文件是否存在
+4. 基于 `release/` 构建 Docker 运行时镜像
+
+支持 `--host`（宿主机构建）、`--no-image`（跳过镜像打包）等选项。
 
 ### 2.1 构建产物校验
 
@@ -218,7 +218,6 @@ providers {
 |----|------|
 | `user_accounts` | 主账号（username/email → password_hash + salt） |
 | `user_profiles` | 玩家资料 |
-| `oauth_accounts` | **新增** OAuth provider + provider_user_id → user_id 映射 |
 | `user_heroes` / `user_items` | 游戏数据 |
 | `battle_history` | 战报记录 |
 
@@ -226,7 +225,7 @@ providers {
 mysql -u root -p < DB/my_database.sql
 ```
 
-DBAgent 启动时会扫描 protobuf `field_options(dgsf.db_table)` 自动 `CREATE TABLE IF NOT EXISTS`，保证表结构最新。
+DBAgent 启动时扫描 protobuf Descriptor，从 `GenerateCreateTableSQL` 自动生成 DDL，自动 `CREATE TABLE IF NOT EXISTS`（`CreateTable` 方法），保证表结构最新。
 
 ## 7. Ubuntu Docker 安装
 

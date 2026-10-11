@@ -41,11 +41,11 @@ Client -> HAProxy -> Gateway/Login -> Transport(Local/Remote) -> Logic/Scenes/Gl
 ### 核心能力
 
 - **CompositeTransport + INode 中介者**：业务层通过统一接口与底层通信完全解耦，同 region 走 SHM 直连（LocalTransport），跨 region 走 TCP → Router（RemoteTransport），由 IsSameRegion 策略在运行时透明路由
-- **MessageHandler 7 步流水线**：OnBefore 钩子 → RequestCorrelator 匹配 → Protobuf 反序列化 → Interceptor 拦截 → cmd 注册表回调 → OnAfter 钩子
+- **MessageHandler 6 步流水线**：pkg 空检查 → request_id 回包匹配 → cmd 查表 → Protobuf 反序列化 → OnBefore 钩子 → 业务 handler → OnAfter 钩子
 - **战斗引擎**：BattleEngine / BattleInstance / BattleRule / SettleManager / StatsManager 完整战斗生命周期
 - **WebSocket 接入**：Gateway 同时支持 TCP 和 WebSocket 客户端
 - **OAuth 2.0 认证**：Google / Facebook / Apple 三大提供商（授权码模式 + JWT 验证 + JWKS 验签）
-- **Kubernetes 部署**：`k8s/` 目录提供 base + overlays dev/prod 的 Kustomize 配置
+- **容器化部署**：Docker Compose 编排（Kubernetes 方案待实现）
 
 更完整的架构细节见 [architecture/architecture_design.md](architecture/architecture_design.md)。
 
@@ -120,7 +120,8 @@ sh docker-compose-prod-down.sh
 
 | 文档 | 重点 |
 |------|------|
-| [architecture/architecture_design.md](architecture/architecture_design.md) | 服务节点职责、CompositeTransport 通信模型、MessageHandler 7 步流水线、核心业务流程、存储设计、关键设计模式 |
+| [architecture/architecture_design.md](architecture/architecture_design.md) | 服务节点职责、CompositeTransport 通信模型、MessageHandler 6 步流水线、核心业务流程、存储设计、关键设计模式 |
+| [architecture/shmqueue_design.md](architecture/shmqueue_design.md) | SHM 消息队列设计（v5.1）：SPSC/SPMC/MPSC/MPMC 四算法、DescriptorRing、零拷贝、Backpressure、Crash Recovery |
 
 ### 部署运维
 
