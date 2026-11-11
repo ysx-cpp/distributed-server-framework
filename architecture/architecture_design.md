@@ -1,6 +1,6 @@
 # 分布式游戏服务器集群 —— 架构设计
 
-本文档描述 NimbusCluster 分布式游戏服务器集群的总体架构、服务节点职责、通信模型、核心业务流程、数据存储与关键设计模式。面向框架维护者和业务服务开发者，重点阐述 **INode 中介者 + CompositeTransport 抽象层 + MessageHandler 流水线** 三大核心支柱，以及 **CM 控制面 + Router SHM 路由表** 的服务发现与分发机制。
+本文档定义 NimbusCluster 分布式游戏服务器集群的目标架构、节点职责、通信机制、生命周期、服务发现、数据存储、部署和兼容性约束。核心设计由 **节点生命周期 + 显式通信语义 + iceoryx2 本机零拷贝数据面 + Router 跨 Region 转发面** 组成。
 
 ## 目录
 
@@ -13,6 +13,7 @@
 7. [数据存储设计](#7-数据存储设计)
 8. [关键设计模式](#8-关键设计模式)
 9. [部署架构](#9-部署架构)
+10. [节点运行模型与通信契约](#10-节点运行模型与通信契约)
 
 ---
 
@@ -20,7 +21,7 @@
 
 ### 1.1 项目定位
 
-NimbusCluster 是一个 **进程化微服务** 的 C++17 游戏服务器集群。框架将典型 MOBA / MMORPG 所需的能力拆分为 **9 种服务节点**，通过 `server_id` 高 16 位（Region）区分物理容器，在同 Region 内用 Boost.Interprocess 共享内存消息队列（ShmQueueRpc，MPSC DescriptorRing）实现亚毫秒级 IPC，跨 Region 由 LocalTransport 自动投递到本机 Router，经 Router TCP 转发到目标 Region。
+NimbusCluster 是一个 **进程化微服务** 的 C++17 游戏服务器集群。框架将典型 MOBA / MMORPG 所需的能力拆分为 **10 种服务节点类型**，通过 `server_id` 高 16 位（Region）区分物理容器，同 Region 使用 iceoryx2 发布/订阅或请求/响应服务实现共享内存 IPC，跨 Region 由 LocalTransport 自动投递到本机 Router，经 Router TCP 转发到目标 Region。
 
 **路由表分发**采用双模式服务发现 → Router SHM 架构。`discovery.mode=etcd` 时：业务实例经 `EtcdRegistrar` lease 自注册，Router 由 `EtcdRouteInformer` 同步（GetPrefix 全量快照 → Watch 事件）+ `RouteReconciler` 展开路由，经奇偶协议写本机 SHM 路由表。`discovery.mode=cm`/空时：CM（ClusterManager）将注册信息写入 Redis（HSET + INCR 全局版本号），经观察者模式 TCP 通知各 Region Router（RouterObserver），Router 同样以奇偶协议更新 SHM。两种模式下消费者均通过 atomic 版本号乐观锁读取 SHM 路由表。
 
@@ -33,7 +34,7 @@ NimbusCluster 是一个 **进程化微服务** 的 C++17 游戏服务器集群�
 | C++17 单体仓库 | 所有服务共用一份 CMake 顶层，减少构建复杂度 |
 | Boost.Asio 单线程 io_context | 每个服务实例 1 个 io_context，多实例并行，避免共享状态 |
 | Protobuf + gRPC | 统一消息编码；gRPC 仅用于跨语言接口预留，内部 RPC 走 SHM/TCP |
-| 共享内存文件命名 | 以 `server_id` 为 key，每个服务实例一组 SHMQ（1 pull + N push） |
+| iceoryx2 Service 命名 | `nimbus/<env>/<region>/<service>/<pattern>/<schema>`，按消息契约创建本机端点 |
 | Redis + MySQL | Redis 做热数据/排行榜/路由表存储，MySQL 做持久化存储 |
 | 10 种服务节点固定集 | Router / Gateway / Login / DBAgent / Logic / Scenes / Global / Battle / ClusterManager / Payment，由 `protocol::ServerType` 枚举统一管理（`PAYMENT = 10`，`clustermanager` 配置字段号 10 对应 `type: 9`） |
 | ServerID 编码规则 | `uint32_t server_id = ((region << 16) & 0xFFFF0000) \| ((type << 8) & 0x0000FF00) \| (index & 0x000000FF)`；例：Region 2 + Logic(5) + index 0 = 0x00020500 |
@@ -43,9 +44,9 @@ NimbusCluster 是一个 **进程化微服务** 的 C++17 游戏服务器集群�
 | 场景 | 协议/通道 | 说明 |
 |------|-----------|------|
 | 客户端 → Gateway | TCP / WebSocket | HAProxy 前置 TCP 负载均衡；Login 走 HTTP 重定向登录 |
-| 服务 → 服务（同 region） | **SHM 消息队列**（ShmQueueRpc，MPSC DescriptorRing） | LocalTransport 直连目标服务的 pull 队列，无中间转发 |
+| 服务 → 服务（同 region） | **iceoryx2**（本机共享内存 Publish-Subscribe / Request-Response） | LocalTransport 通过 iceoryx2 Service 直达目标进程，不经应用层中转 |
 | 服务 → 服务（跨 region） | **LocalTransport → 本机 Router SHM → TCP → 目标 region Router → SHM** | 业务无感自动路由：LocalTransport::DoSend 检测 dst_region != my_region 时自动投本机 Router |
-| Gateway → Logic → DBAgent | SHM（同 Region） | 典型热路径，走 LocalTransport（同 Region SHM Queue） |
+| Gateway → Logic → DBAgent | SHM（同 Region） | 典型热路径，走 LocalTransport（同 Region iceoryx2） |
 | 服务实例注册 | **etcd（EtcdRegistrar lease 自注册）或 CM（TCP RouterRegister）** | `discovery.mode=etcd` 时实例经 lease 保活上报，宕机自动摘除；`cm` 时经 CM 注册 |
 | 路由表分发 | **etcd 模式：Router 的 EtcdRouteInformer 监听 etcd → RouteReconciler（拓扑×在线实例）→ SHM 奇偶协议写入；cm 模式：CM（Redis HSET+INCR）→ 观察者 TCP 通知 → Router → SHM** | 两种模式都写同一张本机 SHM 路由表；消费者通过 `RouteLookupByType`/`RouteLookupLeader` 乐观锁读取 |
 | Login → DBAgent | SHM（同 Region）或 TCP（跨 Region） | OAuth 三提供商账号校验 |
@@ -517,290 +518,49 @@ transport(ServiceBase) → ProviderRegistry → OrderStore/OrderManager → Paym
 
 ## 4. 通信架构
 
-### 4.1 总体分层
+### 4.1 通信分层
 
 ```text
-┌─────────────────────────────────────────────────┐
-│              业务 Handler 层                     │
-│   LogicHandler / GatewayHandler / BattleHandler  │
-│   继承 MessageHandler，注册 cmd → callback 表    │
-└────────────────────┬────────────────────────────┘
-                     │ IMessageHandler::OnMessage()
-┌────────────────────▼────────────────────────────┐
-│           INode 中介者                           │
-│   GetTransport() / GetHandler() 单一数据源       │
-│   RouteLookupByType / RouteLookupLeader          │
-└────────────────────┬────────────────────────────┘
-                     │ ITransport 统一接口
-┌────────────────────▼────────────────────────────┐
-│          LocalTransport（业务服务主传输层）       │
-│   同 region：SHM 直连目标服务                     │
-│   跨 region：SHM 投本机 Router → TCP 转发        │
-│   SendToType/AsyncRequest 对 GLOBAL 走 Leader │
-└────────────────────┬────────────────────────────┘
-                     │
-        ┌────────────┴────────────┐
-        │                         │
-┌───────▼────────┐      ┌────────▼───────────┐
-│  ShmQueueRpc   │      │  本机 Router        │
-│  MPSC Descriptor│      │  (CompositeTransport)│
-│  同 region 直投 │      │  local_=SHM +      │
-│                │      │  remote_=TCP→Router │
-└────────────────┘      └─────────────────────┘
-
-注：Router 是唯一使用 CompositeTransport 的服务，承担跨 Region TCP 转发职责。
-    所有业务服务（Gateway/Login/DBAgent/Logic/Scenes/Global/Battle）统一使用
-    LocalTransport，跨 Region 消息自动经本机 Router 转发，业务无感。
+业务 Service / MessageHandler
+          │ ITransport
+          ▼
+   CompositeTransport
+      ┌───┴──────────────┐
+      │                  │
+同机目标              跨 Region 目标
+LocalTransport        RemoteTransport
+      │                  │
+iceoryx2 Node/Service  本机 Router → TCP → 目标 Router
+      │                  │
+iceoryx2 SHM Service   目标端 LocalTransport
 ```
 
-### 4.2 ITransport 接口
+`ITransport` 隔离业务服务与传输实现。`CompositeTransport` 以目标 Region 选择本机共享内存或跨 Region TCP；路由表只用于目标解析和健康过滤。iceoryx2 管理同机 Service 发现与样本传递，etcd/CM 管理集群节点注册和 Region 路由，两者职责分离。
 
-```cpp
-class ITransport
-{
-public:
-    virtual ~ITransport() = default;
+### 4.2 通信模式与消息契约
 
-    // 初始化
-    virtual bool Init(const protoconf::ServerItem& cfg) = 0;
+| 模式 | 用途 | 本机承载 | 跨 Region 承载 |
+|---|---|---|---|
+| Publish-Subscribe | 可广播事件、状态通知 | iceoryx2 Publisher/Subscriber | Router/TCP 事件 envelope |
+| Request-Response | 定向命令、查询 | iceoryx2 Client/Server | Router/TCP 请求/响应 envelope |
+| Event | 线程唤醒和状态提示 | iceoryx2 Event 或运行时通知 | Router 控制消息；不承载可靠业务数据 |
+| 客户端下行 | 服务端向玩家连接发送 | Gateway ClientAccess/WebSocketAccess | Gateway 外部连接 |
 
-    // 向 CM 发送注册包（仅 CM 模式 RemoteTransport 实现）
-    virtual int SendRegister() { return -1; }
+每条通道声明 service name、pattern、schema_id/version、最大样本尺寸、端点上限、队列深度、deadline、可靠性和溢出策略。启动时检查底层配置是否支持所声明语义，不支持则配置失败。request/response 使用 request_id、deadline、错误码和幂等键；广播事件不承担唯一目标确认。
 
-    // CM 模式专用：向所有 CM 连接发送原始 Package
-    virtual int SendRawToCM(const ipc::Package&) { return -1; }
+### 4.3 Iceoryx2Transport
 
-    // 发送侧（6 方法）
-    virtual int Send(uint16_t cmd, UserId uid, uint32_t dst_server_id,
-                     const google::protobuf::Message& body,
-                     int result, uint64_t request_id = 0) = 0;
+`Iceoryx2Transport` 封装 iceoryx2 C++ binding，管理进程级 Node 和通道级 Service/端点。发布端对共享内存样本 loan，在样本内写入固定布局 envelope 与 POD payload 后 send；接收端 receive 只读样本，完成 Handler 后由 RAII 句柄释放。`IMessageHandler` 只接收 Nimbus envelope/Payload view，不接触第三方 sample 类型。
 
-    virtual int SendToType(uint16_t cmd, UserId uid, uint32_t server_type,
-                           const google::protobuf::Message& body,
-                           int result = 0, uint64_t request_id = 0) = 0;
+Payload 采用标准布局、固定宽度字段，不包含进程私有指针、普通动态容器或裸 Protobuf 对象。Protobuf 继续用于网络 schema 和非热点业务；同机传输避免额外的完整 Payload 复制，但边界转换仍可能复制，因此不定义为端到端零拷贝。
 
-    virtual int Broadcast(uint16_t cmd, UserId uid, uint32_t server_type,
-                          const google::protobuf::Message& msg) = 0;
+### 4.4 RemoteTransport 与 Router
 
-    [[deprecated("Use Send() instead.")]]
-    virtual int Forward(const protocol::Payload& payload) = 0;
+目标 Region 与本机不同，`RemoteTransport` 将 Protobuf 网络 envelope 发送到本机 Router。Router 按版本化路由视图选目标 Region Router，经 TCP 转发；目标端将消息交给对应业务服务。跨机消息不包含共享内存地址、句柄或本机 ABI 数据。request_id 在两端 Transport 维护映射，网络断连或 deadline 到期返回统一错误。
 
-    using ReplyCallback = std::function<void(const ipc::PackagePtr&)>;
+### 4.5 错误、背压与可观测性
 
-    virtual int AsyncRequest(uint16_t cmd, UserId uid, uint32_t server_type,
-                             const google::protobuf::Message& body,
-                             ReplyCallback cb) = 0;
-
-    // Gateway-only：下行包给玩家 ClientAccess
-    virtual int SendToClient(const ipc::Package&) { return -1; }
-
-    // 收包入口
-    virtual int OnPackage(const ipc::PackagePtr& pkg) = 0;
-
-    // 基础设施访问
-    virtual boost::asio::io_context& io_context() = 0;
-    virtual uint32_t server_id() const = 0;
-
-    // Sink 便捷方法（默认委托给 Send 侧）
-    virtual int ReplyToSender(uint16_t cmd, UserId uid, uint32_t src_server_id,
-                              const google::protobuf::Message& body,
-                              int result, uint64_t request_id = 0);
-    virtual int PublishToType(uint16_t cmd, UserId uid, uint32_t server_type,
-                              const google::protobuf::Message& body,
-                              int result = 0, uint64_t request_id = 0);
-    virtual int BroadcastType(uint16_t cmd, UserId uid, uint32_t server_type,
-                              const google::protobuf::Message& msg);
-};
-```
-
-### 4.3 LocalTransport —— 业务服务主传输层与路由决策点
-
-**LocalTransport 是所有业务服务（Gateway/Login/DBAgent/Logic/Scenes/Global/Battle）的统一传输层**，也是业务侧的**唯一路由决策点**。它内部封装了同 Region 直投和跨 Region 经 Router 转发两种路径，业务代码完全无需感知底层走 SHM 还是 TCP。
-
-LocalTransport 通过 `node_.RouteLookupByType` / `RouteLookupLeader`（SHM 路由表）查询目标实例，确保目标健康后再发送；SHM 不可用时降级到静态 ConfigManage。LocalTransport 本身不做健康检查——健康过滤在 INode 的 RouteLookup 层完成。
-
-```cpp
-// 核心路由决策：LocalTransport::DoSend
-int LocalTransport::DoSend(const protocol::Payload& msg)
-{
-    auto dst_server_id = msg.head().dst();
-    auto my_region  = server_id() >> 16;
-    auto dst_region = dst_server_id >> 16;
-
-    uint32_t topic_server_id = dst_server_id;
-    if (my_region != dst_region)
-    {
-        // 跨 region：投本机 Router（由 Router 转发到目标 region）
-        auto router_id = node_.RouteLookupLocalRouter();
-        topic_server_id = router_id;
-    }
-    // msg.head().dst() 始终是最终目标服务 server_id（Router 据此路由）
-    return rpc_.SendMessage(std::to_string(topic_server_id), package);
-}
-
-// RegionStrategy：server_id 高 16 位
-static inline uint32_t RegionOf(uint32_t sid)   { return sid >> 16; }
-static inline bool IsSameRegion(uint32_t a, uint32_t b) { return RegionOf(a) == RegionOf(b); }
-```
-
-#### SendToType 路由策略
-
-```cpp
-int LocalTransport::SendToType(uint16_t cmd, UserId uid, uint32_t server_type,
-                               const google::protobuf::Message& body,
-                               int result, uint64_t request_id)
-{
-    // GLOBAL 类型走 Leader 顺位查询，其他类型走普通查询
-    uint32_t dst_server_id = 0;
-    if (server_type == protocol::ServerType::GLOBAL)
-        dst_server_id = node_.RouteLookupLeader(server_type);
-    else
-        dst_server_id = node_.RouteLookupByType(server_type);
-
-    // SHM 不可用时降级到静态 ConfigManage
-    if (dst_server_id == 0)
-        dst_server_id = ConfigManageSingle::instance().GetServerIdByUidAndType(uid, server_type);
-    if (dst_server_id == 0) return -1;
-
-    return Send(cmd, uid, dst_server_id, body, result, request_id);
-}
-```
-
-**关键点**：LocalTransport 在把目标传给 ShmQueueRpc **之前**，已经通过 SHM 路由表确保了目标是健康的。ShmQueueRpc 是**纯工具库**，不关心健康状态，只负责"把包发出去"。
-
-### 4.4 CompositeTransport —— Router 专用转发层
-
-CompositeTransport 仅由 **Router** 使用，承担跨 Region TCP 转发职责。它内含 `local_`（LocalTransport，接收本 Region 业务进程的跨 Region 消息）和 `remote_`（RemoteTransport，TCP 转发到目标 Region Router）两个成员。
-
-```cpp
-// Router 的 CompositeTransport::Forward 路由决策
-int CompositeTransport::Forward(const protocol::Payload& msg)
-{
-    uint32_t const dst = msg.head().dst();
-    if (IsSameRegion(server_id(), dst))
-        return local_->Forward(msg);   // 同 region：SHM 直连
-    return remote_->Forward(msg);      // 跨 region：TCP → 目标 Router
-}
-```
-
-Router 的 CompositeTransport 在 `Init()` 中初始化 LocalTransport 和 RemoteTransport：
-- `local_`：监听本 Region 业务进程投递到 Router 的跨 Region 消息
-- `remote_`：连接所有其他 Region 的 Router，按 `dst_region` 路由 TCP 转发
-
-### 4.4 LocalTransport —— 同 Region SHM 工具库
-
-LocalTransport 是**纯工具库**，负责基于 POSIX 共享内存的同 Region 进程间通信。它不做健康检查、不做路由决策、不感知对端死活——所有健康过滤在 INode 的 RouteLookup 层已经完成。
-
-| 能力 | 说明 |
-|------|------|
-| Pull 队列 | `InitPullQueue()` 打开本实例 pull 队列，`ShmQueueRpc<MpscDescriptorRing>` 1 pull N push 模式 |
-| Push 队列 | `InitPushQueues()` 为同 region 所有目标服务类型打开 push 队列（从静态配置获取） |
-| 收包线程 | SHM 收包线程 → `OnShmPackage` → `io_context().dispatch(OnPackage)` → `INode.GetHandler().OnMessage()` 分发 |
-| 发包 | `Forward(msg)` / `Send()` 直接写入对应 push 队列；同 region 直投目标，跨 region 投本机 Router |
-| Leader 路由 | `SendToType`/`AsyncRequest` 对 `GLOBAL` 类型使用 `RouteLookupLeader` |
-
-```cpp
-// 跨 region 自动投递到本机 Router
-int LocalTransport::DoSend(const protocol::Payload& msg)
-{
-    auto dst_server_id = msg.head().dst();
-    auto my_region = server_id() >> 16;
-    auto dst_region = dst_server_id >> 16;
-
-    uint32_t topic_server_id = dst_server_id;
-    if (my_region != dst_region)
-    {
-        // 跨 region：投本机 Router（由 Router 转发到目标 region）
-        auto router_id = node_.RouteLookupLocalRouter();
-        topic_server_id = router_id;
-    }
-    // msg.head().dst() 始终是最终目标服务 server_id（Router 据此路由）
-    return rpc_.SendMessage(std::to_string(topic_server_id), package);
-}
-```
-
-### 4.5 RemoteTransport —— 跨 Region TCP → Router 工具库
-
-RemoteTransport 是**纯工具库**，负责跨 Region TCP 消息发送。
-
-| 能力 | 说明 |
-|------|------|
-| 连接策略 | 连接所有 Router 实例（从配置获取）；Router 模式下不连 CM、跳过本 region Router |
-| 发包 | `Forward(msg)` / `Send()`：将消息原样发给目标 Router，Router 查 SHM 路由表转发 |
-| 收包 | `TcpDispatcher` 收包 → `node_.GetHandler().OnMessage(pkg)` 经 INode 中介者分发到业务 Handler |
-| CM 模式 | `MakeCMTransport` 创建的 RemoteTransport 专门用于控制面：连接所有 CM，发送注册包/心跳，`SendRawToCM` 发送控制面消息 |
-| 异步请求 | 跨 region 的 `AsyncRequest` 使用 `ShmQueueRpc` 内部 `pending_` map（request_id 关联回调 + 超时清理） |
-
-### 4.6 AsyncRequest 回调匹配机制
-
-`AsyncRequest` 允许发送方发送请求后不阻塞，等对方回复时自动触发回调。请求-回复匹配由 **ShmQueueRpc** 内部管理，无需独立 Correlator 类。
-
-```cpp
-// 核心机制在 ShmQueueRpc::AsyncRequest 内部
-int ShmQueueRpc::AsyncRequest(uint16_t cmd, UserId uid, uint32_t dst,
-                              const google::protobuf::Message& body,
-                              ITransport::ReplyCallback cb)
-{
-    uint64_t request_id = GetNextRequestId();  // 单调递增
-    pending_[request_id] = cb;                  // 注册回调
-
-    // 发送带 request_id 的 Package
-    PackagePtr pkg = BuildPackage(cmd, uid, dst, body, 0, request_id);
-    SendRaw(pkg);
-    return 0;
-}
-
-// 收包侧：检测 request_id != 0 → 触发 pending callback
-void ShmQueueRpc::OnDispatch(const PackagePtr& pkg)
-{
-    if (pkg->request_id() != 0)
-    {
-        auto it = pending_.find(pkg->request_id());
-        if (it != pending_.end())
-        {
-            it->second(pkg);                // 执行业务回调
-            pending_.erase(it);             // 释放
-        }
-        return;  // 回包不进入 handler 流程
-    }
-    // 普通请求走 handler
-    ...
-}
-```
-
-**请求-回复流程**：
-```
-Logic SendToType(GLOBAL, body, cb)
-  → ShmQueueRpc::AsyncRequest
-        → request_id=42, pending_[42]=<weak_ptr to ServiceBase>
-        → 发送 Package{request_id=42}
-  → Global Handler 处理
-  → Global ReplyToSender(..., <response>, result=0, request_id=42)
-  → ShmQueueRpc::OnDispatch 检测 request_id!=0
-        → pending_[42] 回调触发 ✓
-        → pending_[42] 释放
-```
-
-**关键设计**：
-- request_id 由 ShmQueueRpc 内部单调递增生成，不暴露给上层
-- pending_ 回调存储使用 `weak_ptr`，防止 Service 销毁后悬空
-- 回包（request_id != 0）不进入 MessageHandler 流水线，直接匹配回调
-
-### 4.7 消息编码
-
-统一使用 Protobuf：
-- `protocol/commonmessage.proto` 定义外层消息 `Payload`（head + body）
-- `protocol/commonenum.proto` 定义 cmd 枚举和 `ServerType` 枚举
-- 各业务目录下 `*.proto` 定义业务消息（如 `battle/battlerpc.proto`、`payment/paymentproto.proto`、`gateway/protocol/ss_msg.proto`）
-
-### 4.8 gRPC 预留
-
-- `battlerpc.proto`：Battle 预留跨语言 gRPC 接口（Python / Go 活动服接入）
-- `globalrpc.proto` / `logicrpc.proto` / `scenesrpc.proto`：各服务预留跨语言 gRPC 接口
-- gRPC 仅用于跨语言接口预留；内部 RPC 走 SHM / TCP
-
----
-
+传输错误统一为 `NoService`、`IncompatibleSchema`、`LoanExhausted`、`QueueFull`、`DeadlineExceeded`、`PeerUnavailable`、`Stopped`。每条通道使用有限容量；满载时依声明拒绝或丢弃并记录计数，不允许无界内存增长。关键指标包括发送/接收数、P50/P95/P99、样本 loan 失败、队列积压、丢弃/拒绝、request timeout、端点重建和样本持有时长。
 ## 5. 服务发现与路由表分发
 
 服务发现由 `discovery_cfg.mode`（`localconf.pbtxt` 中的 `discovery.mode`）全局门控，两种模式写同一张本机 SHM 路由表，消费者侧完全一致（`RouteLookupByType` / `RouteLookupLeader`）：
@@ -1182,13 +942,13 @@ sequenceDiagram
 
 `discovery_cfg.watch_prefix` 为前缀、以 InstanceInfo 序列化为 value 的键值对（`EtcdRegistrar` 注册 / 天然 lease 过期摘除），Router `EtcdRouteInformer` 通过 GetPrefix + Watch 读取；验证（auth）通过 `discovery_cfg.user/password`、TLS 通过 `ca_file/cert_file/key_file` 配置。
 
-### 7.3 共享内存（Boost.Interprocess）
+### 7.3 共享内存与路由表
 
-- 每个服务实例一组 SHM：pull 队列 + N push 队列（按同 region 目标服务类型）
+- 同机业务消息由 iceoryx2 管理的 Service、Publisher/Subscriber、Client/Server 和共享内存样本承载；每条通道的容量、样本尺寸和端点数由服务配置定义
 - 路由表 SHM：`nimbus_route_table_r{region}`（256KB，`src/common/shm/routetable.h` 的 `RouteTableShmName(region)`；由各 Region Router 创建，同容器业务进程只读；Router 重启时 `open_or_create` 保留既有段、校验失败才删除重建，已 attach 进程不中断）
-- 队列文件命名：`/dev/shm/dgsf/{server_id}_{role}`（`ipc::shm::MpscDescriptorRing`）
+- iceoryx2 runtime root 与 `/dev/shm` 容量按部署配置统一管理；应用不创建自研消息队列段
 - 生产 Docker Compose 设置 `shm_size: 512m`，Battle 容器 `shm_size: 256m`
-- **一个容器 = 一台主机**：容器 MUST have independent IPC namespaces；NEVER use `ipc: host`
+- **一个容器 = 一台主机**：同机通信节点共享受限 IPC namespace 与 iceoryx2 runtime；跨机不共享 SHM
 
 ---
 
@@ -1248,7 +1008,7 @@ public:
 MessageHandler::OnMessage 内部 6 步流水线：
 
 1. **pkg 空检查**
-2. **request_id 匹配**：若 `pkg->request_id() != 0`，触发 `ShmQueueRpc` 的 pending callback 并返回（回包不走 handler）
+2. **request_id 匹配**：若 `pkg->request_id() != 0`，由 `ITransport` pending map 完成请求回调并返回（回包不进入业务 cmd handler）
 3. **cmd 查表**：`handlers_.find(cmd)`
 4. **ParseFromArray**：反序列化 Payload
 5. **OnBefore()** → 虚钩子（LogicHandler 打开玩家 SHM；GlobalHandler 检查 Leader）
@@ -1329,16 +1089,129 @@ RemoteTransport 作为底层 TCP 连接（`RpcClient`）和 `ITransport` 接口�
 
 ### 9.4 关键部署约束
 
-- **一个容器 = 一台主机**：容器即主机，无需"模拟"概念；容器 MUST have independent IPC namespaces
-- **NEVER use `ipc: host`**：共享 `/dev/shm` 会导致 SHM 队列消费者冲突
-- **SHM 消息队列仅用于同容器（同主机）IPC**：跨容器通信走 TCP/Router
-- `shm_size` 控制容器私有 `/dev/shm` 大小（默认 64MB 太小，使用 256m+）
-- `region` 字段标识主机/容器：
-  - region=0: CM 容器（clustermanager ×4；**不部署 Router**）
-  - region=1: login 容器（login ×2 + dbagent ×2 + router）
-  - region=2: server 容器（gateway ×2 + logic ×2 + scenes ×2 + dbagent ×2 + router）
-  - region=3: global 容器（global ×2 + dbagent ×2 + router）
-  - region=4: battle 容器（battle ×2 + router）
-  - region=6: payment 容器（payment ×2 + dbagent + router）
-  - region=5,7...: 额外主机
-- Server ID 编码：`(region << 16) | (type << 8) | index` — 不同 regions 永不冲突
+- 每个 Region 对应一个主机部署故障域；同机通信节点共享受限的 IPC namespace 和一致的 iceoryx2 runtime 配置。
+- iceoryx2 仅用于同机进程通信；跨 Region 一律经 Router/TCP，不共享 SHM 地址或句柄。
+- `/dev/shm` 容量覆盖所有通道样本池预算，并预留 20% 余量；容器和 Pod 的 shm 配置不得低于该值。
+- 配置 startup、readiness、liveness 探针；readiness 仅在节点 Active、Service/端点就绪且依赖满足后成功。
+- 优雅终止先撤销 ready 并停止接收新请求，再有界 drain、释放 iceoryx2 资源并撤销服务发现注册。
+- `region` 字段标识部署故障域：region=0 为 CM；region=1 为 login；region=2 为 server；region=3 为 global；region=4 为 battle；region=6 为 payment；region=5、7 等用于扩展部署。
+- Server ID 编码：`(region << 16) | (type << 8) | index`，不同 Region 的实例标识互不冲突。
+## 10. 节点运行模型与通信契约
+
+NimbusCluster 以节点自治、显式通信契约、发现与数据面分离、托管生命周期和可组合部署为设计原则。节点 API 使用 C++17、Boost.Asio 与 Protobuf；本机共享内存由 iceoryx2 承载，跨 Region 由 TCP Router 承载。
+
+### 10.1 分层逻辑
+
+| 层级 | 组件 | 职责与边界 |
+|---|---|---|
+| 接入层 | HAProxy、Gateway、Login、Payment HTTP | 终止外部 TCP/WebSocket/HTTP，完成认证、连接管理和外部回调；不直接访问业务数据库 |
+| 节点运行时层 | `NodeContext`、Lifecycle、Health | 管理节点身份、配置、资源、激活/停用、readiness 和有序关闭；不承载业务路由规则 |
+| 应用通信层 | `INode`、`ITransport`、`MessageHandler` | 以统一接口表达单播、请求响应与事件；完成 cmd 分发、request_id 匹配、反序列化及业务处理 |
+| 本机数据面 | `Iceoryx2Transport`、iceoryx2 Node/Service/Publisher/Subscriber/Client/Server | 进程间同 Region 共享内存通信；固定布局消息直接在 loan sample 中构造并发送 |
+| 跨 Region 数据面 | `RemoteTransport`、Router、TCP | 将目标 Region 外的请求经本机 Router 转发到目标 Router；不将 SHM 对象跨机传输 |
+| 控制面 | etcd 或 ClusterManager、RouteReconciler、路由快照 | 节点注册、租约/心跳、健康状态、拓扑匹配和路由更新；控制面不进入消息热路径 |
+| 数据持久层 | Redis、DBAgent、MySQL | Redis 提供缓存/会话/排行榜；业务通过 DBAgent 访问 MySQL |
+| 部署与可观测层 | Docker、Kubernetes、日志/指标/追踪 | 声明 Region、服务副本、资源限制、探针、终止期限及运行指标 |
+
+### 10.2 节点模型与通信语义
+
+每个可执行服务是一个独立节点，身份由 `service_type + region + instance_id` 唯一确定。节点有稳定逻辑服务名与运行时地址；容器/PID/IP 不作为持久身份。Router 是 Region 数据转发节点，ClusterManager 是 CM 发现模式下的控制面节点，其余服务按业务职责运行。
+
+| 语义 | Nimbus 接口与承载 | 交付约束 |
+|---|---|---|---|
+| 单向业务事件 | `ITransport::Publish` → iceoryx2 Publish-Subscribe；跨 Region 通过 Router/TCP 事件信封 | 定义 topic、消息类型/版本、队列容量、历史深度、可靠性、慢订阅者处理方式；不用于需要唯一目标确认的命令 |
+| 定向命令/查询 | `ITransport::Request` → iceoryx2 Request-Response Client/Server；跨 Region 通过 Router/TCP RPC 信封 | request_id、deadline、取消、错误码和幂等键是协议字段；响应匹配由 transport 管理 |
+| 长任务 | `ITransport::StartTask/CancelTask/TaskStatus`，由 request/response 与事件组合 | 必须提供任务 ID、进度/结果、取消语义和超时；当前战斗/匹配业务按业务协议实现，不虚构独立消息中间件 |
+| 控制信号 | iceoryx2 Event，或本机运行时事件通知 | Event 只唤醒/提示状态变化，可靠业务数据仍从数据通道读取；不得把有限通知队列当作持久事件日志 |
+
+通道描述符统一声明：`reliability`、`history/depth`、`deadline`、`lifespan`、`durability`、`max_payload` 和 `overflow_policy`。iceoryx2 实际可配置能力以固定版本 API 为准；未被底层直接支持的策略由 Nimbus adapter 校验并实施，不能静默降级。QoS 与 service name、消息类型和 schema version 共同参与端点兼容判断。
+
+### 10.3 生命周期管理
+
+节点生命周期状态固定为：
+
+```text
+Unconfigured → Inactive → Active → Finalized
+       └──────────────→ ErrorProcessing → Finalized
+```
+
+- `Configure`：读取并校验配置、节点身份、schema/ABI 版本；初始化日志、指标和运行时 Node。
+- `Activate`：打开 iceoryx2 Service/端点，初始化 Handler 和 Router 路由视图；控制面注册为 not-ready，业务依赖就绪后置 ready 并进入 Active。
+- `Deactivate`：先撤销 ready 并停止接收新业务，再在 deadline 内 drain 在途请求；向外部观察者报告 draining。
+- `Cleanup`：关闭端点和 Service，释放 Node、线程、连接和配置资源；重复调用安全。
+- `Shutdown`：撤销 etcd lease 或 CM 注册，完成进程级退出。
+- `ErrorProcessing`：记录失败阶段与错误码，按资源获取的逆序回滚；不发布 ready 状态。
+
+Readiness 表示节点可接收业务；Liveness 表示进程/event loop 仍能推进。健康探针不以 TCP 端口可连接替代业务 readiness。etcd lease 失效或 CM 心跳超时后，Router 将节点从可用路由集中摘除。
+
+### 10.4 服务发现与交互关系
+
+```mermaid
+sequenceDiagram
+    participant N as 业务 Node
+    participant D as etcd / ClusterManager
+    participant R as Region Router
+    participant I as iceoryx2 Service Registry
+    participant P as 本机 Publisher/Client
+    participant S as 目标 Subscriber/Server
+    N->>I: 创建或打开本机 Service/端点
+    N->>D: 注册身份、能力、schema 版本、not-ready
+    N->>N: Activate 并检查传输/业务依赖
+    N->>D: 标记 ready
+    D-->>R: 注册/健康变更
+    R->>R: Reconcile 拓扑与健康实例，更新路由快照
+    P->>S: 同 Region 共享内存发送 loan sample
+    P->>R: 跨 Region 请求封装后发送
+    R-->>S: TCP 转发至目标 Region Router/节点
+```
+
+iceoryx2 Service Registry 负责本机端点发现；etcd/CM 负责集群节点发现和 Region 路由。两种发现域职责不同，不互相替代。Service identity 由逻辑 service name、消息类型、schema version 和 Region namespace 构成；使用唯一的 `nimbus/<env>/<region>/<service>/<pattern>/<schema>` 命名空间。动态端点发现不改变业务节点身份，也不用于跨 Region 网络寻址。
+
+### 10.5 iceoryx2 核心组件与 API 适配
+
+`Iceoryx2Transport` 是 `ITransport` 的本机实现，封装 iceoryx2 C++ binding，不向业务 Handler 暴露第三方类型。节点内一个 iceoryx2 Node 持有多个 Service 句柄；服务实例按消息契约创建 Publisher/Subscriber 或 Client/Server。发布和接收使用 RAII 样本句柄管理共享内存所有权。
+
+```cpp
+class ITransport {
+public:
+    virtual SendResult Publish(const MessageKey&, PayloadView) = 0;
+    virtual RequestHandle Request(const MessageKey&, PayloadView, Deadline) = 0;
+    virtual void Cancel(const RequestHandle&) = 0;
+    virtual void StopAccepting() = 0;
+    virtual void Close() = 0;
+};
+```
+
+本机 Publish-Subscribe 适配流程：从 Publisher `loan` 固定布局样本 → 在共享内存样本中写入 `MessageEnvelope + payload` → `send` → Subscriber `receive` → 校验 envelope/schema → 将只读视图传入 Handler → 样本 RAII 句柄在处理结束后释放。Request-Response 使用 Client loan request/send 与 Server receive/respond，response 由 pending request map 按 request_id 完成。底层操作返回错误对象，adapter 转换为统一 `SendResult/TransportError`，包括 `NoService`、`NoSubscribers`、`LoanExhausted`、`QueueFull`、`IncompatibleSchema`、`DeadlineExceeded`、`PeerUnavailable` 和 `Stopped`。
+
+Protobuf 仍是业务 schema 与网络序列化格式。共享内存 zero-copy payload 必须是标准布局、固定 ABI、无裸指针/进程私有地址、无跨进程不安全动态容器的类型。大型热点消息定义专用 `ShmPayload` POD 结构；Protobuf 解码可在 Handler 边界按需发生，因而“零拷贝”仅指 iceoryx2 发布/订阅数据面不做中间 Payload 复制，不宣称端到端序列化零拷贝。消息类型和 schema version 不匹配时拒绝端点连接或消息，不尝试盲目 reinterpret。
+
+### 10.6 性能约束与验收指标
+
+- 本机 IPC 不发生每消息 OS 堆分配；样本来自 iceoryx2 管理的预配置共享内存池。容量/大小档按实测消息分布配置，池耗尽返回可识别错误并计数。
+- 热路径只执行 loan、定长字段写入、发布/接收、边界校验与 Handler 调用；禁止同步日志和无界阻塞。
+- 本机 IPC 性能门槛：与同硬件当前 SHM 基线相比，吞吐不得下降超过 5%；P99 延迟不得恶化超过 10%；目标消息尺寸 128B/1KB/4KB 分别报告吞吐和 P50/P95/P99。首发验收目标为 100K msg/s/进程（128B，至少 1 publisher/1 subscriber），具体服务容量按负载测试结果配置。
+- 共享内存预算必须满足 `pool_size ≥ Σ(topic_capacity × max_sample_size × subscriber_retention)`，并额外预留 20% 运维余量；容器 tmpfs/共享内存上限不得小于配置总和。
+- 跨 Region TCP 单独设定时延与吞吐基线，不与本机 IPC SLO 混算。性能报告记录 CPU、上下文切换、丢弃/拒绝、loan 失败、队列积压、样本持有时间及恢复时间。
+
+上述值是开发验收阈值，不是未测量的现状声明。部署版本必须随版本化基准报告记录硬件、编译选项、iceoryx2 版本、配置和测量结果。
+
+### 10.7 兼容性与版本治理
+
+1. iceoryx2 版本、C++ binding 版本、编译器 ABI 和目标平台写入依赖锁定文件；升级需重建全部节点并通过跨进程兼容测试。
+2. 共享内存消息使用独立 POD schema，含 `schema_id`、`schema_version`、`payload_size`、`request_id`、deadline 和 trace id。字段采用固定宽度整数，结构显式对齐并通过 `sizeof/alignof/offsetof` 静态断言。
+3. 同一个 iceoryx2 Service 的发布者和订阅者必须使用兼容的消息布局和 QoS。滚动升级时为不兼容 schema 使用新 service name/version；Router 以能力标签隔离版本，避免新旧进程共读同一布局。
+4. 业务 `ITransport` 接口提供稳定的发送、请求响应和客户端下行入口；本机通信由 iceoryx2 承载，节点升级采用停机、资源释放、再启动的顺序，避免不同 IPC 实现并行占用同一通信端点。
+5. 跨 Region envelope 保持 Protobuf wire schema；本机 POD 与 TCP Protobuf 由 codec 转换，不要求远端共享内存 ABI 一致。
+
+### 10.8 部署说明
+
+每个容器显式配置 iceoryx2 runtime 根目录、共享内存/tmpfs 容量、文件权限、节点名、service 上限、最大 publisher/subscriber 数、队列深度和样本大小。所有需要通信的同机容器必须共享相同 IPC namespace 与配置一致的 iceoryx2 runtime 路径；Kubernetes 使用 host IPC 或经过验证的共享 IPC 部署方式，并设置 shm volume。跨主机不共享 SHM，必须使用 Router/TCP。部署探针分别映射 Liveness、Readiness 和 startup 状态；终止宽限期覆盖停止接收、drain、关闭 Service 和撤销注册。
+
+
+
+
+
+
+
+

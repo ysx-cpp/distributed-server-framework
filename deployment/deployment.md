@@ -8,7 +8,8 @@
 
 - CMake 3.15+
 - C++17 编译器
-- Boost.Asio / Boost.Interprocess
+- Boost.Asio
+- iceoryx2 C++ binding（版本由依赖锁定文件固定）
 - Protobuf + gRPC（gRPC 仅用于跨语言接口预留；内部 RPC 走 SHM/TCP）
 - glog
 - hiredis + redis-plus-plus
@@ -276,3 +277,4 @@ Ubuntu 22.04 的 Docker 安装步骤保留在 [ubuntu_docker_setup.md](ubuntu_do
 - Payment 容器以 `-p "${PAYMENT_BIND:-127.0.0.1}:30061:16001"` 暴露公网回调入口，需要对外接收商家回调时设置 `PAYMENT_BIND=0.0.0.0`。
 - Battle 容器独立于 Server 容器部署，`docker-compose-up.sh` 中它在 Server 之后、Payment/HAProxy 之前启动。
 - 各容器通过 `-v ../../config/<svc>:...` 挂载本地配置，勿以宿主机源码覆盖运行时镜像（`docker-compose-prod-up.sh` 用镜像内二进制）。
+

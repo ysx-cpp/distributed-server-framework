@@ -23,7 +23,7 @@
 
 ### 通信与数据流
 
-客户端登录后通过 `Gateway` 建立 TCP 或 WebSocket 长连接，业务消息经 **CompositeTransport** 决策后走 LocalTransport（同 region，SHM 消息队列直连目标服务队列）或 RemoteTransport（跨 region，TCP → Router 转发）。各服务启动时从本地配置（`localconf.pbtxt`）加载本机信息与 `topology.pbtxt` 全集群拓扑（ConfigManage 合并），并依据 `discovery.mode` 完成服务注册：`etcd` 模式经 `EtcdRegistrar`（lease 自注册）上报在线实例，Router 经 `EtcdRouteInformer` 维护 SHM 路由表；`cm` 模式经 CM 注册并通知 Router。`Logic` 负责会话与业务处理，需要持久化时通过 `DBAgent` 访问 MySQL，并通过 Redis 缓存会话、账号索引。`Global` 作为全局协调层处理匹配、排行榜与全服广播，`Battle` 作为战斗引擎实例执行具体战斗逻辑，`Payment` 负责订单支付与发货触发。
+客户端登录后通过 `Gateway` 建立 TCP 或 WebSocket 长连接，业务消息经 **CompositeTransport** 决策后走 LocalTransport（同 region，iceoryx2 共享内存 Service 直连目标进程）或 RemoteTransport（跨 region，TCP → Router 转发）。各服务启动时从本地配置（`localconf.pbtxt`）加载本机信息与 `topology.pbtxt` 全集群拓扑（ConfigManage 合并），并依据 `discovery.mode` 完成服务注册：`etcd` 模式经 `EtcdRegistrar`（lease 自注册）上报在线实例，Router 经 `EtcdRouteInformer` 维护 SHM 路由表；`cm` 模式经 CM 注册并通知 Router。`Logic` 负责会话与业务处理，需要持久化时通过 `DBAgent` 访问 MySQL，并通过 Redis 缓存会话、账号索引。`Global` 作为全局协调层处理匹配、排行榜与全服广播，`Battle` 作为战斗引擎实例执行具体战斗逻辑，`Payment` 负责订单支付与发货触发。
 
 Logic / Scenes / Battle 预留跨语言 gRPC 接口（Python / Go 活动服接入）。
 
@@ -62,7 +62,7 @@ Client -> HAProxy -> Gateway/Login/Payment -> Transport(Local/Remote) -> Logic/S
 | 异步 IO | Boost.Asio |
 | 消息协议 | Protobuf |
 | 跨语言 RPC | gRPC（Logic / Scenes / Battle / Global 预留跨语言接口） |
-| 进程间通信 | Boost.Interprocess / 共享内存消息队列（ShmQueueRpc，MPSC DescriptorRing） |
+| 进程间通信 | iceoryx2 共享内存 IPC（Publish-Subscribe / Request-Response） |
 | 服务发现 | etcd（EtcdClient + EtcdRegistrar + EtcdRouteInformer，`discovery.mode=etcd`）/ ClusterManager（`cm` 模式）双实现 |
 | 配置 | 本地 `localconf.pbtxt` + 全集群 `topology.pbtxt`（ConfigManage 合并） |
 | 缓存 | Redis / redis-plus-plus |
@@ -127,8 +127,7 @@ sh docker-compose-prod-down.sh
 
 | 文档 | 重点 |
 |------|------|
-| [architecture/architecture_design.md](architecture/architecture_design.md) | 服务节点职责、CompositeTransport 通信模型、MessageHandler 6 步流水线、核心业务流程、存储设计、关键设计模式 |
-| [architecture/shmqueue_design.md](architecture/shmqueue_design.md) | SHM 消息队列设计（v5.1）：SPSC/SPMC/MPSC/MPMC 四算法、DescriptorRing、零拷贝、Backpressure、Crash Recovery |
+| [architecture/architecture_design.md](architecture/architecture_design.md) | 服务节点职责、通信与发现、生命周期、部署模型、节点模型、生命周期、通信契约和 iceoryx2 数据面 |
 
 ### 部署运维
 
@@ -143,3 +142,7 @@ sh docker-compose-prod-down.sh
 | 文档 | 重点 |
 |------|------|
 | [devops/gitlab-ci-cd.md](devops/gitlab-ci-cd.md) | GitLab CI 4-stage 流水线：build → test → image → deploy |
+
+
+
+
